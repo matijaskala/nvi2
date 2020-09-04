@@ -15,8 +15,10 @@
 
 #include <bitstring.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "common.h"
@@ -146,12 +148,23 @@ db_get(SCR *sp,
 
 nocache:
 	/* Get the line from the underlying database. */
+	memset(&key, 0, sizeof(key));
 	key.data = &lno;
 	key.size = sizeof(lno);
+	memset(&data, 0, sizeof(data));
+#ifdef DB_VERSION_MAJOR
+	switch (ep->db->get(ep->db, NULL, &key, &data, 0)) {
+	case 0:
+		break;
+	default:
+		goto err2;
+	case DB_NOTFOUND:
+#else
 	switch (ep->db->get(ep->db, &key, &data, 0)) {
 	case -1:
 		goto err2;
 	case 1:
+#endif
 err1:		if (LF_ISSET(DBG_FATAL))
 err2:			db_err(sp, lno);
 alloc_err:
@@ -220,9 +233,14 @@ db_delete(SCR *sp, recno_t lno)
 	log_line(sp, lno, LOG_LINE_DELETE);
 
 	/* Update file. */
+	memset(&key, 0, sizeof(key));
 	key.data = &lno;
 	key.size = sizeof(lno);
+#ifdef DB_VERSION_MAJOR
+	if (ep->db->del(ep->db, NULL, &key, 0) != 0) {
+#else
 	if (ep->db->del(ep->db, &key, 0) == 1) {
+#endif
 		msgq(sp, M_SYSERR,
 		    "003|unable to delete line %lu", (u_long)lno);
 		return (1);
@@ -253,6 +271,9 @@ int
 db_append(SCR *sp, int update, recno_t lno, CHAR_T *p, size_t len)
 {
 	DBT data, key;
+#ifdef DB_VERSION_MAJOR
+	DBC *dbcp_put;
+#endif
 	EXF *ep;
 	char *fp;
 	size_t flen;
@@ -270,15 +291,73 @@ db_append(SCR *sp, int update, recno_t lno, CHAR_T *p, size_t len)
 	INT2FILE(sp, p, len, fp, flen);
 
 	/* Update file. */
+	memset(&key, 0, sizeof(key));
 	key.data = &lno;
 	key.size = sizeof(lno);
+	memset(&data, 0, sizeof(data));
 	data.data = fp;
 	data.size = flen;
+#ifdef DB_VERSION_MAJOR
+	if ((ep->db->cursor(ep->db, NULL, &dbcp_put, 0)) != 0)
+	    return 1;
+	if (lno != 0) {
+		if (dbcp_put->c_get(dbcp_put, &key, &data, DB_SET) != 0) {
+			(void)dbcp_put->c_close(dbcp_put);
+			msgq(sp, M_SYSERR,
+			    "004|unable to append to line %lu", (u_long)lno);
+			return (1);
+		}
+
+		memset(&data, 0, sizeof(data));
+		data.data = fp;
+		data.size = flen;
+		if (dbcp_put->c_put(dbcp_put, &key, &data, DB_AFTER) != 0) {
+			(void)dbcp_put->c_close(dbcp_put);
+			msgq(sp, M_SYSERR,
+			    "004|unable to append to line %lu", (u_long)lno);
+			return (1);
+		}
+	} else {
+		int db_error;
+		if ((db_error = dbcp_put->c_get(dbcp_put, &key, &data, DB_FIRST)) != 0) {
+			if (db_error != DB_NOTFOUND) {
+				(void)dbcp_put->c_close(dbcp_put);
+				msgq(sp, M_SYSERR,
+				    "004|unable to append to line %lu", (u_long)lno);
+				return (1);
+			}
+			memset(&data, 0, sizeof(data));
+			data.data = fp;
+			data.size = flen;
+			if (ep->db->put(ep->db, NULL, &key, &data, DB_APPEND) != 0) {
+				(void)dbcp_put->c_close(dbcp_put);
+				msgq(sp, M_SYSERR,
+				    "004|unable to append to line %lu", (u_long)lno);
+				return (1);
+			}
+		} else {
+			memset(&key, 0, sizeof(key));
+			key.data = &lno;
+			key.size = sizeof(lno);
+			memset(&data, 0, sizeof(data));
+			data.data = fp;
+			data.size = flen;
+			if (dbcp_put->c_put(dbcp_put, &key, &data, DB_BEFORE) != 0) {
+				(void)dbcp_put->c_close(dbcp_put);
+				msgq(sp, M_SYSERR,
+				    "004|unable to append to line %lu", (u_long)lno);
+				return (1);
+			}
+		}
+	}
+	(void)dbcp_put->c_close(dbcp_put);
+#else
 	if (ep->db->put(ep->db, &key, &data, R_IAFTER) == -1) {
 		msgq(sp, M_SYSERR,
 		    "004|unable to append to line %lu", (u_long)lno);
 		return (1);
 	}
+#endif
 
 	/* Flush the cache, update line count, before screen update. */
 	if (lno < ep->c_lno)
@@ -324,6 +403,9 @@ int
 db_insert(SCR *sp, recno_t lno, CHAR_T *p, size_t len)
 {
 	DBT data, key;
+#ifdef DB_VERSION_MAJOR
+	DBC *dbcp_put;
+#endif
 	EXF *ep;
 	char *fp;
 	size_t flen;
@@ -342,6 +424,67 @@ db_insert(SCR *sp, recno_t lno, CHAR_T *p, size_t len)
 	INT2FILE(sp, p, len, fp, flen);
 		
 	/* Update file. */
+#ifdef DB_VERSION_MAJOR
+	recno_t lno1 = lno - 1;
+	memset(&key, 0, sizeof(key));
+	key.data = &lno1;
+	key.size = sizeof(lno1);
+	memset(&data, 0, sizeof(data));
+	data.data = fp;
+	data.size = flen;
+	if ((ep->db->cursor(ep->db, NULL, &dbcp_put, 0)) != 0)
+	    return 1;
+	if (lno1 != 0) {
+		if (dbcp_put->c_get(dbcp_put, &key, &data, DB_SET) != 0) {
+			(void)dbcp_put->c_close(dbcp_put);
+			msgq(sp, M_SYSERR,
+			    "005|unable to insert at line %lu", (u_long)lno);
+			return (1);
+		}
+		memset(&data, 0, sizeof(data));
+		data.data = fp;
+		data.size = flen;
+		if (dbcp_put->c_put(dbcp_put, &key, &data, DB_AFTER) != 0) {
+			(void)dbcp_put->c_close(dbcp_put);
+			msgq(sp, M_SYSERR,
+			    "005|unable to insert at line %lu", (u_long)lno);
+			return (1);
+		}
+	} else {
+		int db_error;
+		if ((db_error = dbcp_put->c_get(dbcp_put, &key, &data, DB_FIRST)) != 0) {
+			if (db_error != DB_NOTFOUND) {
+				(void)dbcp_put->c_close(dbcp_put);
+				msgq(sp, M_SYSERR,
+				    "005|unable to insert at line %lu", (u_long)lno);
+				return (1);
+			}
+			memset(&data, 0, sizeof(data));
+			data.data = fp;
+			data.size = flen;
+			if (ep->db->put(ep->db, NULL, &key, &data, DB_APPEND) != 0) {
+				(void)dbcp_put->c_close(dbcp_put);
+				msgq(sp, M_SYSERR,
+				    "005|unable to insert at line %lu", (u_long)lno);
+				return (1);
+			}
+		} else {
+			memset(&key, 0, sizeof(key));
+			key.data = &lno1;
+			key.size = sizeof(lno1);
+			memset(&data, 0, sizeof(data));
+			data.data = fp;
+			data.size = flen;
+			if (dbcp_put->c_put(dbcp_put, &key, &data, DB_BEFORE) != 0) {
+				(void)dbcp_put->c_close(dbcp_put);
+				msgq(sp, M_SYSERR,
+				    "005|unable to insert at line %lu", (u_long)lno);
+				return (1);
+			}
+		}
+	}
+	(void)dbcp_put->c_close(dbcp_put);
+#else
 	key.data = &lno;
 	key.size = sizeof(lno);
 	data.data = fp;
@@ -351,6 +494,7 @@ db_insert(SCR *sp, recno_t lno, CHAR_T *p, size_t len)
 		    "005|unable to insert at line %lu", (u_long)lno);
 		return (1);
 	}
+#endif
 
 	/* Flush the cache, update line count, before screen update. */
 	if (lno >= ep->c_lno)
@@ -407,11 +551,17 @@ db_set(SCR *sp, recno_t lno, CHAR_T *p, size_t len)
 	INT2FILE(sp, p, len, fp, flen);
 
 	/* Update file. */
+	memset(&key, 0, sizeof(key));
 	key.data = &lno;
 	key.size = sizeof(lno);
+	memset(&data, 0, sizeof(data));
 	data.data = fp;
 	data.size = flen;
+#ifdef DB_VERSION_MAJOR
+	if (ep->db->put(ep->db, NULL, &key, &data, 0) != 0) {
+#else
 	if (ep->db->put(ep->db, &key, &data, 0) == -1) {
+#endif
 		msgq(sp, M_SYSERR,
 		    "006|unable to store line %lu", (u_long)lno);
 		return (1);
@@ -476,6 +626,9 @@ int
 db_last(SCR *sp, recno_t *lnop)
 {
 	DBT data, key;
+#ifdef DB_VERSION_MAJOR
+	DBC *dbcp;
+#endif
 	EXF *ep;
 	recno_t lno;
 	CHAR_T *wp;
@@ -499,16 +652,32 @@ db_last(SCR *sp, recno_t *lnop)
 		return (0);
 	}
 
+	memset(&key, 0, sizeof(key));
 	key.data = &lno;
 	key.size = sizeof(lno);
+	memset(&data, 0, sizeof(data));
 
+#ifdef DB_VERSION_MAJOR
+	if (ep->db->cursor(ep->db, NULL, &dbcp, 0) != 0)
+	    goto alloc_err;
+	switch (dbcp->c_get(dbcp, &key, &data, DB_LAST)) {
+	case 0:
+		break;
+	default:
+		(void)dbcp->c_close(dbcp);
+#else
 	switch (ep->db->seq(ep->db, &key, &data, R_LAST)) {
 	case -1:
+#endif
 alloc_err:
 		msgq(sp, M_SYSERR, "007|unable to get last line");
 		*lnop = 0;
 		return (1);
+#ifdef DB_VERSION_MAJOR
+	case DB_NOTFOUND:
+#else
 	case 1:
+#endif
 		*lnop = 0;
 		return (0);
 	}
@@ -528,6 +697,10 @@ alloc_err:
 		ep->c_len = wlen;
 	}
 	ep->c_nlines = lno;
+
+#ifdef DB_VERSION_MAJOR
+	(void)dbcp->c_close(dbcp);
+#endif
 
 	/* Return the value. */
 	*lnop = (F_ISSET(sp, SC_TINPUT) &&
@@ -553,9 +726,15 @@ db_rget(SCR *sp,
 	int rval;
 
 	/* Get the line from the underlying database. */
+	memset(&key, 0, sizeof(key));
 	key.data = &lno;
 	key.size = sizeof(lno);
+	memset(&data, 0, sizeof(data));
+#ifdef DB_VERSION_MAJOR
+	if ((rval = ep->db->get(ep->db, NULL, &key, &data, 0)) == 0)
+#else
 	if ((rval = ep->db->get(ep->db, &key, &data, 0)) == 0)
+#endif
 	{
 		*lenp = data.size;
 		*pp = data.data;
@@ -577,11 +756,17 @@ db_rset(SCR *sp, recno_t lno, char *p, size_t len)
 	EXF *ep = sp->ep;
 
 	/* Update file. */
+	memset(&key, 0, sizeof(key));
 	key.data = &lno;
 	key.size = sizeof(lno);
+	memset(&data, 0, sizeof(data));
 	data.data = p;
 	data.size = len;
+#ifdef DB_VERSION_MAJOR
+	return ep->db->put(ep->db, NULL, &key, &data, 0);
+#else
 	return ep->db->put(ep->db, &key, &data, 0);
+#endif
 }
 
 /*
@@ -618,4 +803,122 @@ scr_update(SCR *sp, recno_t lno, lnop_t op, int current)
 				if (vs_change(tsp, lno, op))
 					return (1);
 	return (current ? vs_change(sp, lno, op) : 0);
+}
+
+/* Round up v to the nearest power of 2 */
+static size_t round_up(size_t v)
+{
+	ssize_t old_v = v;
+
+	while (v) {
+		old_v = v;
+		v ^= v & -v;
+	}
+	return old_v << 1;
+}
+
+/*
+ * PUBLIC: int db_init (SCR *, EXF *, char *, char *, size_t, int *);
+ */
+int
+db_init(SCR *sp, EXF *ep, char *rcv_name, char *oname, size_t psize, int *open_err) {
+#ifdef DB_VERSION_MAJOR
+	char path[PATH_MAX];
+	int fd;
+	DB_ENV	*env;
+
+	(void)snprintf(path, sizeof(path), "%s/vi.XXXXXX", O_STR(sp, O_RECDIR));
+	if ((fd = mkstemp(path)) == -1) {
+		msgq(sp, M_SYSERR, "%s", path);
+		return 1;
+	}
+	(void)close(fd);
+	(void)unlink(path);
+	if (mkdir(path, S_IRWXU)) {
+		msgq(sp, M_SYSERR, "%s", path);
+		return 1;
+	}
+	if (db_env_create(&env, 0)) {
+		msgq(sp, M_ERR, "env_create");
+		return 1;
+	}
+	if (env->open(env, path, 
+	    DB_PRIVATE | DB_CREATE | DB_INIT_MPOOL, 0) != 0) {
+		msgq(sp, M_SYSERR, "env->open");
+		return 1;
+	}
+
+	if ((ep->env_path = strdup(path)) == NULL) {
+		msgq(sp, M_SYSERR, NULL);
+		(void)rmdir(path);
+		return 1;
+	}
+	ep->env = env;
+
+	/* Open a db structure. */
+	if (db_create(&ep->db, 0, 0) != 0) {
+		msgq(sp, M_SYSERR, "db_create");
+		return 1;
+	}
+
+	ep->db->set_re_delim(ep->db, '\n');		/* Always set. */
+	ep->db->set_pagesize(ep->db, round_up(psize));
+	ep->db->set_flags(ep->db, DB_RENUMBER | DB_SNAPSHOT);
+	if (rcv_name == NULL)
+		ep->db->set_re_source(ep->db, oname);
+
+#define _DB_OPEN_MODE	S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH | S_IWOTH
+
+	if (ep->db->open(ep->db, NULL, ep->rcv_path, NULL, DB_RECNO,
+	    ((rcv_name == 0) ? DB_TRUNCATE : 0) | DB_NOMMAP | DB_CREATE,
+	    _DB_OPEN_MODE) != 0) {
+#else
+
+	/* Set up recovery. */
+	RECNOINFO oinfo = { 0 };
+	oinfo.bval = '\n';			/* Always set. */
+	oinfo.psize = psize;
+	oinfo.flags = F_ISSET(sp->gp, G_SNAPSHOT) ? R_SNAPSHOT : 0;
+	oinfo.bfname = ep->rcv_path;
+
+	/* Open a db structure. */
+	if ((ep->db = dbopen(rcv_name == NULL ? oname : NULL,
+	    O_NONBLOCK | O_RDONLY,
+	    S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH | S_IWOTH,
+	    DB_RECNO, &oinfo)) == NULL) {
+#endif
+		msgq_str(sp,
+		    M_SYSERR, rcv_name == NULL ? oname : rcv_name, "%s");
+		/*
+		 * !!!
+		 * Historically, vi permitted users to edit files that couldn't
+		 * be read.  This isn't useful for single files from a command
+		 * line, but it's quite useful for "vi *.c", since you can skip
+		 * past files that you can't read.
+		 */ 
+		*open_err = 1;
+		return 1;
+	}
+
+#ifdef DB_VERSION_MAJOR
+	/* re_source is loaded into the database.
+	 * Close it and reopen it in the environment. 
+	 */
+	if (ep->db->close(ep->db, 0)) {
+		msgq(sp, M_SYSERR, "close");
+		return 1;
+	}
+	if (db_create(&ep->db, ep->env, 0) != 0) {
+		msgq(sp, M_SYSERR, "db_create 2");
+		return 1;
+	}
+	if (ep->db->open(ep->db, NULL, ep->rcv_path, NULL, DB_RECNO,
+	    DB_NOMMAP | DB_CREATE, _DB_OPEN_MODE) != 0) {
+		msgq_str(sp,
+		    M_SYSERR, ep->rcv_path, "%s");
+		return 1;
+	}
+#endif
+
+	return 0;
 }

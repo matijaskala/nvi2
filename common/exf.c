@@ -24,7 +24,6 @@
 #include <bitstring.h>
 #include <dirent.h>
 #include <errno.h>
-#include <fcntl.h>
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -117,7 +116,6 @@ int
 file_init(SCR *sp, FREF *frp, char *rcv_name, int flags)
 {
 	EXF *ep;
-	RECNOINFO oinfo = { 0 };
 	struct stat sb;
 	size_t psize;
 	int fd, exists, open_err, readonly;
@@ -240,38 +238,20 @@ file_init(SCR *sp, FREF *frp, char *rcv_name, int flags)
 	}
 
 	/* Set up recovery. */
-	oinfo.bval = '\n';			/* Always set. */
-	oinfo.psize = psize;
-	oinfo.flags = F_ISSET(sp->gp, G_SNAPSHOT) ? R_SNAPSHOT : 0;
 	if (rcv_name == NULL) {
-		if (!rcv_tmp(sp, ep, frp->name))
-			oinfo.bfname = ep->rcv_path;
+		rcv_tmp(sp, ep, frp->name);
 	} else {
 		if ((ep->rcv_path = strdup(rcv_name)) == NULL) {
 			msgq(sp, M_SYSERR, NULL);
 			goto err;
 		}
-		oinfo.bfname = ep->rcv_path;
 		F_SET(ep, F_MODIFIED);
 	}
 
 	/* Open a db structure. */
-	if ((ep->db = dbopen(rcv_name == NULL ? oname : NULL,
-	    O_NONBLOCK | O_RDONLY,
-	    S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH | S_IWOTH,
-	    DB_RECNO, &oinfo)) == NULL) {
-		msgq_str(sp,
-		    M_SYSERR, rcv_name == NULL ? oname : rcv_name, "%s");
-		if (F_ISSET(frp, FR_NEWFILE))
+	if (db_init(sp, ep, rcv_name, oname, psize, &open_err)) {
+		if (open_err && F_ISSET(frp, FR_NEWFILE))
 			goto err;
-		/*
-		 * !!!
-		 * Historically, vi permitted users to edit files that couldn't
-		 * be read.  This isn't useful for single files from a command
-		 * line, but it's quite useful for "vi *.c", since you can skip
-		 * past files that you can't read.
-		 */ 
-		open_err = 1;
 		goto oerr;
 	}
 
@@ -338,8 +318,14 @@ file_init(SCR *sp, FREF *frp, char *rcv_name, int flags)
 	 * when locking is a little more reliable, this should change to be
 	 * an error.
 	 */
-	if (rcv_name == NULL)
-		switch (file_lock(sp, oname, ep->db->fd(ep->db), 0)) {
+	if (rcv_name == NULL) {
+		int fd;
+#ifdef DB_VERSION_MAJOR
+		ep->db->fd(ep->db, &fd);
+#else
+		fd = ep->db->fd(ep->db);
+#endif
+		switch (file_lock(sp, oname, fd, 0)) {
 		case LOCK_FAILED:
 			F_SET(frp, FR_UNLOCKED);
 			break;
@@ -353,6 +339,7 @@ file_init(SCR *sp, FREF *frp, char *rcv_name, int flags)
 		case LOCK_SUCCESS:
 			break;
 		}
+	}
 
 	/*
          * Historically, the readonly edit option was set per edit buffer in
@@ -435,7 +422,11 @@ oerr:	if (F_ISSET(ep, F_RCV_ON))
 	ep->rcv_path = NULL;
 
 	if (ep->db != NULL)
+#ifdef DB_VERSION_MAJOR
+		(void)ep->db->close(ep->db, DB_NOSYNC);
+#else
 		(void)ep->db->close(ep->db);
+#endif
 	free(ep);
 
 	return (open_err ?
@@ -685,7 +676,11 @@ file_end(SCR *sp, EXF *ep, int force)
 	 *
 	 * Close the db structure.
 	 */
+#ifdef DB_VERSION_MAJOR
+	if (ep->db->close != NULL && ep->db->close(ep->db, DB_NOSYNC) && !force) {
+#else
 	if (ep->db->close != NULL && ep->db->close(ep->db) && !force) {
+#endif
 		msgq_str(sp, M_SYSERR, frp->name, "241|%s: close");
 		++ep->refcnt;
 		return (1);
@@ -698,6 +693,21 @@ file_end(SCR *sp, EXF *ep, int force)
 
 	/* Free up any marks. */
 	(void)mark_end(sp, ep);
+
+#ifdef DB_VERSION_MAJOR
+	if (ep->env) {
+		DB_ENV *env = ep->env;
+
+		env->close(env, 0);
+		ep->env = 0;
+		if ((db_env_create(&env, 0)))
+			msgq(sp, M_SYSERR, "env_create");
+		if ((env->remove(env, ep->env_path, 0)))
+			msgq(sp, M_SYSERR, "env->remove");
+		if (ep->env_path != NULL && rmdir(ep->env_path))
+			msgq_str(sp, M_SYSERR, ep->env_path, "242|%s: remove");
+	}
+#endif
 
 	/*
 	 * Delete recovery files, close the open descriptor, free recovery

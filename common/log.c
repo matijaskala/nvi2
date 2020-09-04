@@ -106,9 +106,14 @@ log_init(SCR *sp, EXF *ep)
 	ep->l_cursor.cno = 0;
 	ep->l_high = ep->l_cur = 1;
 
+#ifdef DB_VERSION_MAJOR
+	if (db_create(&ep->log, 0, 0) != 0 ||
+	    ep->log->open(ep->log, NULL, NULL, NULL, DB_RECNO, DB_CREATE, S_IRUSR | S_IWUSR) != 0) {
+#else
 	ep->log = dbopen(NULL, O_CREAT | O_NONBLOCK | O_RDWR,
 	    S_IRUSR | S_IWUSR, DB_RECNO, NULL);
 	if (ep->log == NULL) {
+#endif
 		msgq(sp, M_SYSERR, "009|Log file");
 		F_SET(ep, F_NOLOG);
 		return (1);
@@ -131,7 +136,11 @@ log_end(SCR *sp, EXF *ep)
 	 * ep MAY NOT BE THE SAME AS sp->ep, DON'T USE THE LATTER.
 	 */
 	if (ep->log != NULL) {
+#ifdef DB_VERSION_MAJOR
+		(void)(ep->log->close)(ep->log, DB_NOSYNC);
+#else
 		(void)(ep->log->close)(ep->log);
+#endif
 		ep->log = NULL;
 	}
 	free(ep->l_lp);
@@ -188,11 +197,17 @@ log_cursor1(SCR *sp, int type)
 	ep->l_lp[0] = type;
 	memmove(ep->l_lp + sizeof(u_char), &ep->l_cursor, sizeof(MARK));
 
+	memset(&key, 0, sizeof(key));
 	key.data = &ep->l_cur;
 	key.size = sizeof(recno_t);
+	memset(&data, 0, sizeof(data));
 	data.data = ep->l_lp;
 	data.size = sizeof(u_char) + sizeof(MARK);
+#ifdef DB_VERSION_MAJOR
+	if (ep->log->put(ep->log, NULL, &key, &data, 0) != 0)
+#else
 	if (ep->log->put(ep->log, &key, &data, 0) == -1)
+#endif
 		LOG_ERR;
 
 #if defined(DEBUG) && 0
@@ -266,11 +281,17 @@ log_line(SCR *sp, recno_t lno, u_int action)
 	memmove(ep->l_lp + CHAR_T_OFFSET, lp, len * sizeof(CHAR_T));
 
 	lcur = ep->l_cur;
+	memset(&key, 0, sizeof(key));
 	key.data = &lcur;
 	key.size = sizeof(recno_t);
+	memset(&data, 0, sizeof(data));
 	data.data = ep->l_lp;
 	data.size = len * sizeof(CHAR_T) + CHAR_T_OFFSET;
+#ifdef DB_VERSION_MAJOR
+	if (ep->log->put(ep->log, NULL, &key, &data, 0) != 0)
+#else
 	if (ep->log->put(ep->log, &key, &data, 0) == -1)
+#endif
 		LOG_ERR;
 
 #if defined(DEBUG) && 0
@@ -334,11 +355,17 @@ log_mark(SCR *sp, LMARK *lmp)
 	ep->l_lp[0] = LOG_MARK;
 	memmove(ep->l_lp + sizeof(u_char), lmp, sizeof(LMARK));
 
+	memset(&key, 0, sizeof(key));
 	key.data = &ep->l_cur;
 	key.size = sizeof(recno_t);
+	memset(&data, 0, sizeof(data));
 	data.data = ep->l_lp;
 	data.size = sizeof(u_char) + sizeof(LMARK);
+#ifdef DB_VERSION_MAJOR
+	if (ep->log->put(ep->log, NULL, &key, &data, 0) != 0)
+#else
 	if (ep->log->put(ep->log, &key, &data, 0) == -1)
+#endif
 		LOG_ERR;
 
 #if defined(DEBUG) && 0
@@ -381,11 +408,17 @@ log_backward(SCR *sp, MARK *rp)
 
 	F_SET(ep, F_NOLOG);		/* Turn off logging. */
 
+	memset(&key, 0, sizeof(key));
 	key.data = &ep->l_cur;		/* Initialize db request. */
 	key.size = sizeof(recno_t);
+	memset(&data, 0, sizeof(data));
 	for (didop = 0;;) {
 		--ep->l_cur;
+#ifdef DB_VERSION_MAJOR
+		if (ep->log->get(ep->log, NULL, &key, &data, 0))
+#else
 		if (ep->log->get(ep->log, &key, &data, 0))
+#endif
 			LOG_ERR;
 #if defined(DEBUG) && 0
 		log_trace(sp, "log_backward", ep->l_cur, data.data);
@@ -480,11 +513,17 @@ log_setline(SCR *sp)
 
 	F_SET(ep, F_NOLOG);		/* Turn off logging. */
 
+	memset(&key, 0, sizeof(key));
 	key.data = &ep->l_cur;		/* Initialize db request. */
 	key.size = sizeof(recno_t);
+	memset(&data, 0, sizeof(data));
 	for (;;) {
 		--ep->l_cur;
+#ifdef DB_VERSION_MAJOR
+		if (ep->log->get(ep->log, NULL, &key, &data, 0))
+#else
 		if (ep->log->get(ep->log, &key, &data, 0))
+#endif
 			LOG_ERR;
 #if defined(DEBUG) && 0
 		log_trace(sp, "log_setline", ep->l_cur, data.data);
@@ -567,11 +606,17 @@ log_forward(SCR *sp, MARK *rp)
 
 	F_SET(ep, F_NOLOG);		/* Turn off logging. */
 
+	memset(&key, 0, sizeof(key));
 	key.data = &ep->l_cur;		/* Initialize db request. */
 	key.size = sizeof(recno_t);
+	memset(&data, 0, sizeof(data));
 	for (didop = 0;;) {
 		++ep->l_cur;
+#ifdef DB_VERSION_MAJOR
+		if (ep->log->get(ep->log, NULL, &key, &data, 0))
+#else
 		if (ep->log->get(ep->log, &key, &data, 0))
+#endif
 			LOG_ERR;
 #if defined(DEBUG) && 0
 		log_trace(sp, "log_forward", ep->l_cur, data.data);
@@ -644,7 +689,11 @@ log_err(SCR *sp, char *file, int line)
 
 	msgq(sp, M_SYSERR, "015|%s/%d: log put error", basename(file), line);
 	ep = sp->ep;
+#ifdef DB_VERSION_MAJOR
+	(void)ep->log->close(ep->log, DB_NOSYNC);
+#else
 	(void)ep->log->close(ep->log);
+#endif
 	if (!log_init(sp, ep))
 		msgq(sp, M_ERR, "267|Log restarted");
 }

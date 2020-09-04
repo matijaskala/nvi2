@@ -15,6 +15,8 @@ struct _exf {
 	int	 refcnt;		/* Reference count. */
 
 					/* Underlying database state. */
+	void	*env;
+	char	*env_path;
 	DB	*db;			/* File db structure. */
 	CHAR_T	*c_lp;			/* Cached line. */
 	size_t	 c_len;			/* Cached line length. */

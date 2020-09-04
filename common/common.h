@@ -16,6 +16,11 @@
 #else
 #include <db.h>
 #endif
+#ifdef DB_VERSION_MAJOR
+typedef db_recno_t recno_t;
+#define R_RECNOSYNC 0
+#define MAX_REC_NUMBER DB_MAX_RECORDS
+#endif
 #include <regex.h>		/* May refer to the bundled regex. */
 
 /*
